@@ -9,7 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
-use crate::progress::{report_done, report_error, report_file, report_list, ProgressTx, TransferFile};
+use crate::progress::{report_done, report_error, report_file, report_list, report_status, ProgressTx, TransferFile};
 use crate::protocol::*;
 
 pub struct SendOptions {
@@ -19,6 +19,15 @@ pub struct SendOptions {
     pub compress: bool,
     pub checksum: bool,
     pub overwrite: bool,
+    /// Shown on the receiver ("Allow files from X?"). Defaults to this PC's hostname.
+    pub sender_name: String,
+}
+
+/// This PC's hostname for the approval prompt on the receiver.
+pub fn my_sender_name() -> String {
+    hostname::get()
+        .map(|h| h.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "unknown PC".to_string())
 }
 
 struct Job {
@@ -153,6 +162,28 @@ pub async fn run_send(files: Vec<PathBuf>, opt: SendOptions) -> Result<()> {
     run_send_with_progress(files, opt, None).await
 }
 
+/// A data worker died: join the workers and return the first real (usually
+/// TCP) error instead of "channel closed", so a killed receiver reports as
+/// "Stopped by receiver" and the tab auto-closes on both sides.
+async fn worker_failure(handles: Vec<tokio::task::JoinHandle<Result<()>>>) -> anyhow::Error {
+    let mut first: Option<anyhow::Error> = None;
+    for mut h in handles {
+        tokio::select! {
+            r = &mut h => {
+                if let Ok(Err(e)) = r {
+                    if first.is_none() {
+                        first = Some(e);
+                    }
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                h.abort();
+            }
+        }
+    }
+    first.unwrap_or_else(|| anyhow::anyhow!("data worker gone"))
+}
+
 pub async fn run_send_with_progress(
     files: Vec<PathBuf>,
     opt: SendOptions,
@@ -198,9 +229,9 @@ pub async fn run_send_with_progress(
         flags |= H_OVERWRITE;
     }
 
-    // Handshake
+    // Handshake (v2: sender name appended so the receiver can ask for approval)
     {
-        let mut buf = Vec::with_capacity(32);
+        let mut buf = Vec::with_capacity(64);
         buf.extend_from_slice(&MAGIC.to_le_bytes());
         buf.extend_from_slice(&VERSION.to_le_bytes());
         buf.extend_from_slice(&flags.to_le_bytes());
@@ -209,6 +240,8 @@ pub async fn run_send_with_progress(
         buf.extend_from_slice(&(jobs.len() as u64).to_le_bytes());
         buf.extend_from_slice(&total_bytes.to_le_bytes());
         ctrl.write_all(&buf).await?;
+        let name = if opt.sender_name.trim().is_empty() { my_sender_name() } else { opt.sender_name.clone() };
+        write_name(&mut ctrl, name.trim()).await?;
         ctrl.flush().await?;
     }
     // Reply: MAGIC u32, VERSION u16, STATUS u8, DATA_PORT u16
@@ -227,6 +260,35 @@ pub async fn run_send_with_progress(
         }
     }
     println!("Handshake OK (data_port={}, streams={})", data_port_num, nstreams);
+
+    // Offer: file list for the receiver's allow/deny prompt, then verdict.
+    // GUI file list (files only, in send order) + per-file positions.
+    let gui_files: Vec<TransferFile> = jobs
+        .iter()
+        .filter(|j| !j.is_dir)
+        .map(|j| TransferFile { name: j.rel.clone(), size: j.size })
+        .collect();
+    report_list(&gui, total_bytes, "Waiting for approval...", gui_files);
+    {
+        let offer: Vec<OfferFile> = jobs
+            .iter()
+            .map(|j| OfferFile {
+                kind: if j.is_dir { OFFER_DIR } else { OFFER_FILE },
+                rel: j.rel.clone(),
+                size: j.size,
+            })
+            .collect();
+        write_offer(&mut ctrl, &offer).await?;
+        ctrl.flush().await?;
+    }
+    println!("Waiting for receiver approval...");
+    report_status(&gui, 0, total_bytes, "Waiting for approval...");
+    let verdict = read_u8(&mut ctrl).await.context("eof waiting for receiver approval")?;
+    if verdict != VERDICT_ALLOW {
+        report_error(&gui, 0, total_bytes, crate::progress::DECLINED);
+        anyhow::bail!("receiver declined the transfer");
+    }
+    println!("Approved — sending...");
 
     // Open data connections
     let mut txs: Vec<mpsc::Sender<ChunkMsg>> = Vec::new();
@@ -275,14 +337,8 @@ pub async fn run_send_with_progress(
     let mut sent_bytes: u64 = 0;
 
     let mut file_idx: u64 = 0;
-    // GUI file list (files only, in send order) + per-file positions.
-    let gui_files: Vec<TransferFile> = jobs
-        .iter()
-        .filter(|j| !j.is_dir)
-        .map(|j| TransferFile { name: j.rel.clone(), size: j.size })
-        .collect();
     let mut gui_pos: usize = 0;
-    report_list(&gui, total_bytes, "Starting...", gui_files);
+    report_status(&gui, 0, total_bytes, "Starting...");
     for job in &jobs {
         if job.is_dir {
             write_u8(&mut ctrl, ENTRY_DIR).await?;
@@ -406,10 +462,11 @@ pub async fn run_send_with_progress(
                 let chunk = buf[..n].to_vec();
                 let w = rr % txs.len();
                 rr += 1;
-                txs[w]
-                    .send((file_idx, offset, chunk))
-                    .await
-                    .context("data worker gone")?;
+                if txs[w].send((file_idx, offset, chunk)).await.is_err() {
+                    // A dead worker means its TCP stream died — surface the
+                    // worker's real error (not "channel closed").
+                    return Err(worker_failure(std::mem::take(&mut worker_handles)).await);
+                }
                 offset += n as u64;
                 pb.inc(n as u64);
                 sent_bytes += n as u64;

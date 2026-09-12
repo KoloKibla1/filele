@@ -5,13 +5,15 @@
 //! - large files sharded over N parallel TCP streams (4 MB chunks)
 //! - small files inlined on the control stream (batched back-to-back)
 //! - xxh3 checksums (GB/s, negligible overhead), optional lz4 for small files
+//! - v2: receiver approval — sender shows its name + file offer first,
+//!   streams bytes only after the receiver allows (CLI receivers auto-allow).
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 pub const MAGIC: u32 = 0x454C_4C46; // "FLLE" little-endian
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 pub const DEFAULT_PORT: u16 = 53317;
 /// Data port is always control_port + 1 (parallel streams for large files).
@@ -28,6 +30,14 @@ pub const ENTRY_FILE_INLINE: u8 = 1;
 pub const ENTRY_FILE_SHARDED: u8 = 2;
 pub const ENTRY_END: u8 = 0xFF;
 
+/// Verdict sent by the receiver after the offer (allow / deny).
+pub const VERDICT_ALLOW: u8 = 1;
+pub const VERDICT_DENY: u8 = 0;
+
+/// Offer entry kinds (mirror ENTRY_DIR / ENTRY_FILE_* for files).
+pub const OFFER_DIR: u8 = 0;
+pub const OFFER_FILE: u8 = 1;
+
 /// Per-file flags.
 pub const F_COMPRESSED: u8 = 0x01;
 
@@ -43,6 +53,17 @@ pub const INLINE_MEM_LIMIT: u64 = 8 * 1024 * 1024; // <=8 MiB buffered for pipel
 pub const SOCKET_BUF: u32 = 4 * 1024 * 1024; // 4 MiB SO_SND/RCVBUF
 pub const MAX_PATH_LEN: usize = 16 * 1024;
 
+/// True for transport drops mid-transfer (peer went away / stopped).
+/// Used to report "Stopped by ..." instead of a raw EOF/reset error.
+pub fn is_disconnect(e: &anyhow::Error) -> bool {
+    use std::io::ErrorKind;
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>().map(|io| {
+            matches!(io.kind(), ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset | ErrorKind::BrokenPipe | ErrorKind::ConnectionAborted)
+        })
+        .unwrap_or(false)
+    })
+}
 /// Tune a connected Tokio TcpStream for throughput on Windows (IOCP).
 /// - 4 MiB send/recv buffers (overrides tiny Windows defaults)
 /// - Nagle OFF (nodelay=true): our protocol mixes tiny headers (20 B) + big
@@ -132,4 +153,83 @@ pub fn wire_to_path(base: &std::path::Path, wire: &str) -> Result<std::path::Pat
         out.push(comp);
     }
     Ok(out)
+}
+
+/// One entry of the pre-transfer offer (shown on the receiver for approval).
+#[derive(Debug, Clone)]
+pub struct OfferFile {
+    /// OFFER_DIR or OFFER_FILE.
+    pub kind: u8,
+    /// Relative path with `/` separators.
+    pub rel: String,
+    /// Byte size (0 for dirs).
+    pub size: u64,
+}
+
+/// Sender side: write the offer block (file list for approval).
+/// Wire: NFILES u64, then per entry KIND u8, PATH_LEN u16, PATH, SIZE u64.
+pub async fn write_offer(w: &mut (impl AsyncWriteExt + Unpin), files: &[OfferFile]) -> Result<()> {
+    write_u64(w, files.len() as u64).await?;
+    for f in files {
+        write_u8(w, f.kind).await?;
+        if f.rel.len() > MAX_PATH_LEN {
+            anyhow::bail!("path too long: {}", f.rel);
+        }
+        write_u16(w, f.rel.len() as u16).await?;
+        w.write_all(f.rel.as_bytes()).await?;
+        write_u64(w, f.size).await?;
+    }
+    Ok(())
+}
+
+/// Receiver side: read the offer block.
+pub async fn read_offer(r: &mut (impl AsyncReadExt + Unpin)) -> Result<Vec<OfferFile>> {
+    let n = read_u64(r).await? as usize;
+    if n > 10_000_000 {
+        anyhow::bail!("offer too big: {} entries", n);
+    }
+    let mut out = Vec::with_capacity(n.min(65536));
+    for _ in 0..n {
+        let kind = read_u8(r).await?;
+        if kind != OFFER_DIR && kind != OFFER_FILE {
+            anyhow::bail!("bad offer kind {}", kind);
+        }
+        let plen = read_u16(r).await? as usize;
+        if plen == 0 || plen > MAX_PATH_LEN {
+            anyhow::bail!("bad path len");
+        }
+        let mut pbuf = vec![0u8; plen];
+        r.read_exact(&mut pbuf).await.context("eof reading offer path")?;
+        let rel = String::from_utf8(pbuf).context("bad utf8 offer path")?;
+        if rel.split('/').any(|c| c == "..") {
+            anyhow::bail!("path escape: {}", rel);
+        }
+        let size = read_u64(r).await?;
+        out.push(OfferFile { kind, rel, size });
+    }
+    Ok(out)
+}
+
+/// Write a length-prefixed UTF-8 name (sender hostname in the v2 handshake).
+pub async fn write_name(w: &mut (impl AsyncWriteExt + Unpin), name: &str) -> Result<()> {
+    let b = name.as_bytes();
+    if b.len() > 1024 {
+        anyhow::bail!("name too long");
+    }
+    write_u16(w, b.len() as u16).await?;
+    w.write_all(b).await?;
+    Ok(())
+}
+
+/// Read a length-prefixed UTF-8 name.
+pub async fn read_name(r: &mut (impl AsyncReadExt + Unpin)) -> Result<String> {
+    let len = read_u16(r).await? as usize;
+    if len > 1024 {
+        anyhow::bail!("name too long: {}", len);
+    }
+    let mut b = vec![0u8; len];
+    if len > 0 {
+        r.read_exact(&mut b).await.context("eof reading name")?;
+    }
+    Ok(String::from_utf8_lossy(&b).into_owned())
 }

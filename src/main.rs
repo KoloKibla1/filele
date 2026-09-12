@@ -124,9 +124,17 @@ async fn main() -> Result<()> {
                     compress,
                     checksum: !no_checksum,
                     overwrite,
+                    sender_name: sender::my_sender_name(),
                 },
             )
-            .await?;
+            .await
+            .map_err(|e| {
+                if protocol::is_disconnect(&e) {
+                    anyhow::anyhow!(progress::STOPPED_BY_RECEIVER)
+                } else {
+                    e
+                }
+            })?;
         }
         Some(Commands::Recv { bind, port, out, overwrite }) => {
             receiver::run_recv(receiver::RecvOptions { bind, port, out, overwrite }).await?;

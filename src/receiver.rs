@@ -12,13 +12,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, RwLock, Semaphore};
 
-use crate::progress::{ProgressTx, TransferUpdate};
+use crate::progress::{ApprovalTx, ProgressTx, TransferUpdate, STOPPED_BY_SENDER};
 use crate::protocol::*;
 
 struct ShardedState {
     path: PathBuf,
     size: u64,
     received: AtomicU64,
+    /// Position in the files-only list (for per-file progress bars).
+    pos: usize,
 }
 
 type SharedMap = Arc<RwLock<HashMap<u64, Arc<ShardedState>>>>;
@@ -31,10 +33,28 @@ pub struct RecvOptions {
 }
 
 pub async fn run_recv(opt: RecvOptions) -> Result<()> {
-    run_recv_gui(opt, None, Arc::new(AtomicBool::new(false))).await
+    run_recv_gui(opt, None, Arc::new(AtomicBool::new(false)), None).await
 }
 
-pub async fn run_recv_gui(opt: RecvOptions, gui: Option<ProgressTx>, stop: Arc<AtomicBool>) -> Result<()> {
+/// Parsed handshake + offer, read before any bytes flow so the GUI can ask
+/// the user for approval first.
+struct Offer {
+    sender_name: String,
+    token: u64,
+    nstreams: u8,
+    total: u64,
+    do_checksum: bool,
+    do_compress: bool,
+    do_overwrite: bool,
+    files: Vec<OfferFile>,
+}
+
+pub async fn run_recv_gui(
+    opt: RecvOptions,
+    gui: Option<ProgressTx>,
+    stop: Arc<AtomicBool>,
+    approval: Option<ApprovalTx>,
+) -> Result<()> {
     let ctrl_listener = TcpListener::bind((opt.bind.as_str(), opt.port))
         .await
         .with_context(|| format!("bind {}:{} — port in use?", opt.bind, opt.port))?;
@@ -50,8 +70,9 @@ pub async fn run_recv_gui(opt: RecvOptions, gui: Option<ProgressTx>, stop: Arc<A
     }
     println!("Waiting for sender... (run `filele send ... --to <this-ip>`)");
 
-    // Discovery responder in background.
-    tokio::spawn(discovery_task(opt.port));
+    // Discovery responder in background; aborted when listening stops so
+    // this PC disappears from other PCs' device lists.
+    let disc_h = tokio::spawn(discovery_task(opt.port));
 
     fs::create_dir_all(&opt.out).await?;
     let out = Arc::new(opt.out.clone());
@@ -63,20 +84,160 @@ pub async fn run_recv_gui(opt: RecvOptions, gui: Option<ProgressTx>, stop: Arc<A
             break;
         }
         let accept = tokio::time::timeout(std::time::Duration::from_millis(400), ctrl_listener.accept()).await;
-        let (stream, peer) = match accept {
+        let (mut stream, peer) = match accept {
             Ok(Ok(x)) => x,
-            Ok(Err(e)) => return Err(e.into()),
+            Ok(Err(e)) => {
+                disc_h.abort();
+                return Err(e.into());
+            }
             Err(_) => continue, // timeout -> re-check stop flag
         };
         let _ = tune_stream(&stream);
         println!("Incoming transfer from {}", peer);
-        gui_notify(&gui, 0, 0, &format!("Incoming from {}", peer), false, None);
+        // Read handshake + offer first: the GUI approval tab needs the
+        // sender name + file list before a single file byte flows.
+        let offer = match read_offer_from(&mut stream, &data_listener, overwrite_default).await {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("Rejecting {}: {:#}", peer, e);
+                continue;
+            }
+        };
+        let nfiles = offer.files.iter().filter(|f| f.kind == OFFER_FILE).count();
+        println!(
+            "Offer from {} ({}): {} entries ({} files), {} total",
+            offer.sender_name,
+            peer,
+            offer.files.len(),
+            nfiles,
+            crate::sender::human_bytes(offer.total),
+        );
+        // Verdict: CLI receivers auto-allow; GUI receivers ask the user.
+        // Each GUI transfer also gets its own progress channel for its tab,
+        // plus a stop flag for the tab's Stop button.
+        let tab_gui: Option<ProgressTx>;
+        let tab_stop: Option<Arc<AtomicBool>>;
+        match approval.clone() {
+            None => {
+                tab_gui = None;
+                tab_stop = None;
+                write_u8(&mut stream, VERDICT_ALLOW).await?;
+                stream.flush().await?;
+            }
+            Some(atx) => {
+                let (ptx, prx) = tokio::sync::mpsc::unbounded_channel();
+                let (vtx, vrx) = tokio::sync::oneshot::channel();
+                let stop_one = Arc::new(AtomicBool::new(false));
+                let req = crate::progress::ApprovalRequest {
+                    sender_name: offer.sender_name.clone(),
+                    sender_ip: peer.ip().to_string(),
+                    offer: offer.files.clone(),
+                    total: offer.total,
+                    verdict: vtx,
+                    progress_rx: prx,
+                    stop: stop_one.clone(),
+                };
+                if atx.send(req).is_err() {
+                    // GUI gone — deny.
+                    let _ = write_u8(&mut stream, VERDICT_DENY).await;
+                    continue;
+                }
+                // Wait for the user, for listening to stop, or for the
+                // sender to vanish meanwhile (peek consumes nothing).
+                enum WaitOut { Allow, Deny, Gone }
+                let wait = tokio::select! {
+                    r = vrx => if r.unwrap_or(false) { WaitOut::Allow } else { WaitOut::Deny },
+                    _ = async { while !stop.load(Ordering::Relaxed) {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    } } => WaitOut::Deny,
+                    _ = async {
+                        let mut one = [0u8; 1];
+                        loop {
+                            match tokio::time::timeout(std::time::Duration::from_millis(500), stream.peek(&mut one)).await {
+                                Ok(Ok(0)) => break, // EOF: sender went away
+                                Ok(Ok(_)) => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
+                                Ok(Err(_)) => break, // reset: sender went away
+                                Err(_) => continue,  // quiet: still waiting
+                            }
+                        }
+                    } => WaitOut::Gone,
+                };
+                match wait {
+                    WaitOut::Gone => {
+                        println!("Sender {} cancelled before approval", peer);
+                        let _ = ptx.send(TransferUpdate {
+                            sent_bytes: 0,
+                            total_bytes: offer.total,
+                            label: "Cancelled".to_string(),
+                            done: true,
+                            error: Some("Sender cancelled the request".to_string()),
+                            files: None,
+                            file_index: None,
+                            file_sent: None,
+                        });
+                        continue;
+                    }
+                    WaitOut::Deny => {
+                        println!("Declined transfer from {} ({})", offer.sender_name, peer);
+                        let _ = write_u8(&mut stream, VERDICT_DENY).await;
+                        let _ = stream.flush().await;
+                        let _ = ptx.send(TransferUpdate {
+                            sent_bytes: 0,
+                            total_bytes: offer.total,
+                            label: "Declined".to_string(),
+                            done: true,
+                            error: Some(if stop.load(Ordering::Relaxed) {
+                                "Receiver stopped".to_string()
+                            } else {
+                                "You declined the transfer".to_string()
+                            }),
+                            files: None,
+                            file_index: None,
+                            file_sent: None,
+                        });
+                        continue;
+                    }
+                    WaitOut::Allow => {
+                        println!("Approved transfer from {} ({})", offer.sender_name, peer);
+                        if write_u8(&mut stream, VERDICT_ALLOW).await.is_err()
+                            || stream.flush().await.is_err()
+                        {
+                            // Sender vanished while deciding.
+                            let _ = ptx.send(TransferUpdate {
+                                sent_bytes: 0,
+                                total_bytes: offer.total,
+                                label: "Gone".to_string(),
+                                done: true,
+                                error: Some("Sender went away".to_string()),
+                                files: None,
+                                file_index: None,
+                                file_sent: None,
+                            });
+                            continue;
+                        }
+                        tab_gui = Some(ptx);
+                        tab_stop = Some(stop_one);
+                    }
+                }
+            }
+        }
+        gui_notify(&gui, 0, offer.total, &format!("Incoming from {}", peer), false, None);
         let data_listener_ref = data_listener.clone();
         let out_clone = out.clone();
         // Handle one transfer at a time sequentially (simplest + fastest disk).
-        if let Err(e) = handle_transfer(stream, data_listener_ref, out_clone, overwrite_default, gui.clone()).await {
-            eprintln!("Transfer failed: {:#}", e);
-            gui_notify(&gui, 0, 0, "", true, Some(format!("{:#}", e)));
+        if let Err(e) = handle_transfer(stream, data_listener_ref, out_clone, gui.clone(), tab_gui.clone(), tab_stop, offer).await {
+            if e.to_string() == STOP_LOCAL {
+                // Stopped from this side's tab — remote end sees a drop.
+                gui_reset(&gui);
+            } else if is_disconnect(&e) {
+                eprintln!("Sender stopped the transfer");
+                gui_notify2(&None, &tab_gui, 0, 0, "", true, Some(STOPPED_BY_SENDER.to_string()));
+                gui_reset(&gui);
+            } else {
+                eprintln!("Transfer failed: {:#}", e);
+                gui_notify2(&None, &tab_gui, 0, 0, "", true, Some(format!("{:#}", e)));
+                gui_reset(&gui);
+            }
         } else {
             println!("Ready for next transfer...");
         }
@@ -84,12 +245,93 @@ pub async fn run_recv_gui(opt: RecvOptions, gui: Option<ProgressTx>, stop: Arc<A
         RECV_SENT.store(0, Ordering::Relaxed);
         RECV_TOTAL.store(0, Ordering::Relaxed);
     }
+    disc_h.abort();
     Ok(())
+}
+
+/// Read + validate the v2 handshake and the offer block, and send the
+/// handshake reply (STATUS 0). The allow/deny verdict is sent by the caller.
+async fn read_offer_from(
+    ctrl: &mut TcpStream,
+    data_listener: &TcpListener,
+    overwrite_cli: bool,
+) -> Result<Offer> {
+    // Handshake: MAGIC u32, VER u16, FLAGS u16, TOKEN u64, NSTREAMS u8,
+    // NFILES u64, TOTAL u64, NAME_LEN u16, NAME.
+    let magic = read_u32(ctrl).await?;
+    let ver = read_u16(ctrl).await?;
+    if magic != MAGIC || ver != VERSION {
+        let mut rej = Vec::new();
+        rej.extend_from_slice(&MAGIC.to_le_bytes());
+        rej.extend_from_slice(&VERSION.to_le_bytes());
+        rej.push(1);
+        rej.extend_from_slice(&data_port(0).to_le_bytes());
+        let _ = ctrl.write_all(&rej).await;
+        anyhow::bail!("protocol mismatch (got v{}, need v{}) — update filele", ver, VERSION);
+    }
+    let flags = read_u16(ctrl).await?;
+    let token = read_u64(ctrl).await?;
+    let nstreams = read_u8(ctrl).await?;
+    let _nfiles = read_u64(ctrl).await?;
+    let total = read_u64(ctrl).await?;
+    let sender_name = read_name(ctrl).await?;
+    let sender_name = if sender_name.trim().is_empty() { "unknown PC".to_string() } else { sender_name };
+    let do_checksum = flags & H_CHECKSUM != 0;
+    let do_compress = flags & H_COMPRESS != 0;
+    let do_overwrite = overwrite_cli || (flags & H_OVERWRITE != 0);
+
+    // Handshake reply OK + data port (verdict comes later, after the offer).
+    {
+        let dport = data_listener.local_addr().map(|a| a.port()).unwrap_or(data_port(53317));
+        let mut rep = Vec::with_capacity(9);
+        rep.extend_from_slice(&MAGIC.to_le_bytes());
+        rep.extend_from_slice(&VERSION.to_le_bytes());
+        rep.push(0);
+        rep.extend_from_slice(&dport.to_le_bytes());
+        ctrl.write_all(&rep).await?;
+        ctrl.flush().await?;
+    }
+
+    let files = read_offer(ctrl).await?;
+    Ok(Offer { sender_name, token, nstreams, total, do_checksum, do_compress, do_overwrite, files })
 }
 
 fn gui_notify(gui: &Option<ProgressTx>, sent: u64, total: u64, label: &str, done: bool, err: Option<String>) {
     if let Some(tx) = gui {
         let _ = tx.send(TransferUpdate { sent_bytes: sent, total_bytes: total, label: label.to_string(), done, error: err, files: None, file_index: None, file_sent: None });
+    }
+}
+
+/// Aggregate Receive view back to idle (a per-transfer failure must not
+/// kill the whole listening UI — only bind errors do that).
+fn gui_reset(gui: &Option<ProgressTx>) {
+    gui_notify(gui, 0, 0, "Waiting for a sender", false, None);
+}
+
+/// Internal marker: the transfer was stopped from this side's tab.
+const STOP_LOCAL: &str = "Stopped";
+
+/// Progress goes to both the aggregate Receive view and the per-transfer tab.
+fn gui_notify2(
+    agg: &Option<ProgressTx>,
+    tab: &Option<ProgressTx>,
+    sent: u64,
+    total: u64,
+    label: &str,
+    done: bool,
+    err: Option<String>,
+) {
+    for tx in agg.iter().chain(tab.iter()) {
+        let _ = tx.send(TransferUpdate {
+            sent_bytes: sent,
+            total_bytes: total,
+            label: label.to_string(),
+            done,
+            error: err.clone(),
+            files: None,
+            file_index: None,
+            file_sent: None,
+        });
     }
 }
 
@@ -103,56 +345,31 @@ async fn handle_transfer(
     mut ctrl: TcpStream,
     data_listener: std::sync::Arc<TcpListener>,
     out_base: Arc<PathBuf>,
-    overwrite_cli: bool,
-    gui: Option<ProgressTx>,
+    gui_agg: Option<ProgressTx>,
+    gui_tab: Option<ProgressTx>,
+    stop_one: Option<Arc<AtomicBool>>,
+    offer: Offer,
 ) -> Result<()> {
-    // Handshake: MAGIC u32, VER u16, FLAGS u16, TOKEN u64, NSTREAMS u8, NFILES u64, TOTAL u64
-    let magic = read_u32(&mut ctrl).await?;
-    let ver = read_u16(&mut ctrl).await?;
-    if magic != MAGIC || ver != VERSION {
-        // reject
-        let mut rej = Vec::new();
-        rej.extend_from_slice(&MAGIC.to_le_bytes());
-        rej.extend_from_slice(&VERSION.to_le_bytes());
-        rej.push(1);
-        rej.extend_from_slice(&data_port(0).to_le_bytes());
-        let _ = ctrl.write_all(&rej).await;
-        anyhow::bail!("protocol mismatch");
-    }
-    let flags = read_u16(&mut ctrl).await?;
-    let token = read_u64(&mut ctrl).await?;
-    let nstreams = read_u8(&mut ctrl).await?;
-    let nfiles = read_u64(&mut ctrl).await?;
-    let total = read_u64(&mut ctrl).await?;
-    let do_checksum = flags & H_CHECKSUM != 0;
-    let do_compress = flags & H_COMPRESS != 0;
-    let do_overwrite = overwrite_cli || (flags & H_OVERWRITE != 0);
-    let _ = (nfiles, do_compress);
+    let token = offer.token;
+    let nstreams = offer.nstreams;
+    let total = offer.total;
+    let do_checksum = offer.do_checksum;
+    let do_compress = offer.do_compress;
+    let do_overwrite = offer.do_overwrite;
+    let _ = total;
     RECV_TOTAL.store(total, Ordering::Relaxed);
     RECV_SENT.store(0, Ordering::Relaxed);
-    set_shared_gui_tx(gui.clone()).await;
-    gui_notify(&gui, 0, total, "Receiving...", false, None);
+    set_shared_gui_tx(vec![gui_agg.clone(), gui_tab.clone()]).await;
+    gui_notify2(&gui_agg, &gui_tab, 0, total, "Receiving...", false, None);
 
     println!(
-        "Offer: {} total, streams={}, checksum={}, compress={}, overwrite={}",
+        "Receiving: {} total, streams={}, checksum={}, compress={}, overwrite={}",
         crate::sender::human_bytes(total),
         nstreams,
         do_checksum,
         do_compress,
         do_overwrite
     );
-
-    // Reply OK + data port
-    {
-        let dport = data_listener.local_addr().map(|a| a.port()).unwrap_or(data_port(53317));
-        let mut rep = Vec::with_capacity(9);
-        rep.extend_from_slice(&MAGIC.to_le_bytes());
-        rep.extend_from_slice(&VERSION.to_le_bytes());
-        rep.push(0);
-        rep.extend_from_slice(&dport.to_le_bytes());
-        ctrl.write_all(&rep).await?;
-        ctrl.flush().await?;
-    }
 
     let map: SharedMap = Arc::new(RwLock::new(HashMap::new()));
     // Accept data connections concurrently with control loop.
@@ -199,9 +416,31 @@ async fn handle_transfer(
     let mut write_tasks: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::new();
     let mut mismatches: u64 = 0;
     let mut received_bytes: u64 = 0;
+    // Position in the files-only list (matches the offer order shown in the GUI).
+    let mut gui_pos: usize = 0;
 
     loop {
-        let etype = read_u8(&mut ctrl).await?;
+        // Entry read: poll stop flag between entries (readable() never
+        // consumes bytes, so timing out here loses nothing).
+        let etype = match &stop_one {
+            Some(flag) => loop {
+                if flag.load(Ordering::Relaxed) {
+                    for h in data_handles.lock().await.drain(..) {
+                        h.abort();
+                    }
+                    for h in write_tasks.drain(..) {
+                        h.abort();
+                    }
+                    anyhow::bail!(STOP_LOCAL);
+                }
+                match tokio::time::timeout(std::time::Duration::from_millis(400), ctrl.readable()).await {
+                    Ok(Ok(_)) => break read_u8(&mut ctrl).await?,
+                    Ok(Err(e)) => return Err(e.into()),
+                    Err(_) => continue,
+                }
+            },
+            None => read_u8(&mut ctrl).await?,
+        };
         if etype == ENTRY_END {
             break;
         }
@@ -306,7 +545,8 @@ async fn handle_transfer(
                 }
                 received_bytes += orig_size;
                 RECV_SENT.fetch_add(orig_size, Ordering::Relaxed);
-                report_recv_progress(&rel);
+                report_recv_progress(&rel, Some(gui_pos), Some(orig_size));
+                gui_pos += 1;
             }
             ENTRY_FILE_SHARDED => {
                 let _fflags = read_u8(&mut ctrl).await?;
@@ -351,7 +591,9 @@ async fn handle_transfer(
                     path: dest.clone(),
                     size,
                     received: AtomicU64::new(0),
+                    pos: gui_pos,
                 });
+                gui_pos += 1;
                 map.write().await.insert(idx, st);
                 // mtime applied after completion; store pending mtime via sidecar map.
                 set_pending_mtime(idx, mtime).await;
@@ -478,12 +720,12 @@ async fn handle_transfer(
         let total = RECV_TOTAL.load(Ordering::Relaxed);
         let sent = RECV_SENT.load(Ordering::Relaxed);
         if mismatches == 0 {
-            gui_notify(&gui, sent.max(total), total.max(sent), &format!("Received {} ({:.1} MB/s)", crate::sender::human_bytes(sent.max(got)), mbps), true, None);
+            gui_notify2(&gui_agg, &gui_tab, sent.max(total), total.max(sent), &format!("Received {} ({:.1} MB/s)", crate::sender::human_bytes(sent.max(got)), mbps), true, None);
         } else {
-            gui_notify(&gui, sent, total, "", true, Some(format!("{} checksum mismatches", mismatches)));
+            gui_notify2(&gui_agg, &gui_tab, sent, total, "", true, Some(format!("{} checksum mismatches", mismatches)));
         }
     }
-    set_shared_gui_tx(None).await;
+    set_shared_gui_tx(Vec::new()).await;
     reset_idx().await;
     Ok(())
 }
@@ -565,7 +807,7 @@ async fn data_conn_task(
         if let Some(pb) = get_shared_pb().await {
             pb.inc(len as u64);
         }
-        report_recv_progress("Receiving...");
+        report_recv_progress("Receiving...", Some(st.pos), Some(st.received.load(Ordering::Relaxed)));
     }
     Ok(())
 }
@@ -579,20 +821,20 @@ static MTIMES: OnceLock<Mutex<HashMap<u64, u64>>> = OnceLock::new();
 static SHARED_PB: OnceLock<Mutex<Option<ProgressBar>>> = OnceLock::new();
 static RECV_SENT: AtomicU64 = AtomicU64::new(0);
 static RECV_TOTAL: AtomicU64 = AtomicU64::new(0);
-static SHARED_GUI_TX: OnceLock<Mutex<Option<ProgressTx>>> = OnceLock::new();
+static SHARED_GUI_TX: OnceLock<Mutex<Vec<ProgressTx>>> = OnceLock::new();
 
-async fn set_shared_gui_tx(tx: Option<ProgressTx>) {
-    let m = SHARED_GUI_TX.get_or_init(|| Mutex::new(None));
-    *m.lock().await = tx;
+async fn set_shared_gui_tx(txs: Vec<Option<ProgressTx>>) {
+    let m = SHARED_GUI_TX.get_or_init(|| Mutex::new(Vec::new()));
+    *m.lock().await = txs.into_iter().flatten().collect::<Vec<_>>();
 }
 
-fn report_recv_progress(label: &str) {
+fn report_recv_progress(label: &str, file_index: Option<usize>, file_sent: Option<u64>) {
     if let Some(m) = SHARED_GUI_TX.get() {
         // Non-blocking best-effort: try_lock, skip if contended (next chunk will report).
         if let Ok(g) = m.try_lock() {
-            if let Some(tx) = g.as_ref() {
-                let sent = RECV_SENT.load(Ordering::Relaxed);
-                let total = RECV_TOTAL.load(Ordering::Relaxed);
+            let sent = RECV_SENT.load(Ordering::Relaxed);
+            let total = RECV_TOTAL.load(Ordering::Relaxed);
+            for tx in g.iter() {
                 let _ = tx.send(TransferUpdate {
                     sent_bytes: sent,
                     total_bytes: total,
@@ -600,8 +842,8 @@ fn report_recv_progress(label: &str) {
                     done: false,
                     error: None,
                     files: None,
-                    file_index: None,
-                    file_sent: None,
+                    file_index,
+                    file_sent,
                 });
             }
         }

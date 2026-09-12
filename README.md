@@ -18,18 +18,29 @@ All transfers verified byte-identical (blake2) + xxh3 end-to-end checksums, 0 mi
 Just double-click `filele.exe` — with no arguments it opens a friendly window.
 Or run `filele gui`.
 
-- Left sidebar: **Send**, **Receive**, plus one tab per started transfer
-  (`"<name> send"`, name cut to 10 letters).
+- Left sidebar: **Send**, **Receive**, one tab per started transfer
+  (`"<name> send"`, name cut to 10 letters), plus an **INCOMING** section
+  with one tab per incoming request (`"<name> recv"`).
 - **Send**: header, file/folder list (x removes), Add files / Add folder /
   Clear all buttons, target device (name + IP, filled by picking a device),
   Devices nearby list that refreshes itself constantly (Select fills the
   target), options (streams, checksum, compress, overwrite), Send button.
 - **Transfer tab** (opens automatically on send): per-file list with a
   progress bar next to each file, plus an overall bar at the bottom with
-  %, MB sent/total, speed, time left, and current file.
+  %, MB sent/total, speed, time left, and current file. While the other
+  side hasn't approved yet it shows "Waiting for … to accept..."; a deny
+  shows as Failed. **Stop** cancels mid-transfer and closes the tab on both
+  sides. A finished transfer shows elapsed time plus a green
+  "Done, click to close this tab" button (receiver tabs also get
+  "Open folder"). Failures pop up centered (dimmed background); closing the
+  popup also closes that transfer tab. Deny closes the receiver tab at once.
+- **Incoming request tab** (opens automatically on the receiver): shows
+  who wants to send (`"<name> wants to send you files"`) with a scrollable
+  file list + total size, and **Allow / Deny** buttons. After Allow it shows
+  the same per-file + overall progress as a send tab.
 - **Receive**: header, Save to field + Browse, Start being visible button.
   While visible it shows your IPs/hostname, save folder, and incoming progress.
-- Settings (target, folder, options) are remembered in `filele-gui.json`.
+- Defaults every launch: no remembered state — save folder starts as Downloads, theme follows the OS.
 
 ## Why it's fast
 
@@ -136,13 +147,16 @@ filele discover [--timeout 3]
 - `connect timeout — is receiver running?` → start `recv` first, check IP (`discover`), check firewall.
 - `receiver reported N checksum mismatches` → data correct but hash mismatch (shouldn't happen post-fix);
   retry; test with `--no-checksum` to isolate disk vs net; check RAM/disk health.
+- `receiver declined the transfer` → the other side pressed Deny (or isn't running the GUI); CLI receivers auto-allow.
 - Slow (<50 MB/s on GbE): firewall DPI / Wi-Fi / VPN / HDD seek / Defender. Try wired + `--no-checksum` + `--streams 4`.
 - `bind ... port in use?` → another `recv` running or ports held in TIME_WAIT; `taskkill /F /IM filele.exe`.
 
-## Protocol (v1, little-endian)
+## Protocol (v2, little-endian)
 
-Control (`MAGIC u32=0x454C4C46, VER u16=1, FLAGS u16, TOKEN u64, NSTREAMS u8, NFILES u64, TOTAL u64`)
+Control (`MAGIC u32=0x454C4C46, VER u16=2, FLAGS u16, TOKEN u64, NSTREAMS u8, NFILES u64, TOTAL u64, NAME_LEN u16, NAME`)
 → reply (`MAGIC, VER, STATUS u8, DATA_PORT u16`).
+Then the offer (`NFILES u64`, per entry `KIND u8 (0=dir, 1=file), PATH_LEN u16, PATH, SIZE u64`)
+→ verdict (`1=allow, 0=deny`). Bytes flow only after allow; CLI receivers auto-allow.
 Then per entry: `DIR(0) | INLINE(1) | SHARDED(2)` + `FLAGS u8, PATH_LEN u16, PATH, SIZE u64, MTIME u64, MODE u32`
 + `XXH3 u64` (inline) / `NCHUNKS u32, CHUNK u32` (sharded), bytes inline or on data streams
 (`FILE_IDX u64, OFFSET u64, LEN u32, bytes`). End: `0xFF + N u64 + (IDX, XXH3)*`. Final ack: `STATUS u8, MISMATCH u64`.

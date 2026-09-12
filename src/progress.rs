@@ -3,6 +3,10 @@
 
 use tokio::sync::mpsc::UnboundedSender;
 
+use std::sync::{atomic::AtomicBool, Arc};
+
+use crate::protocol::OfferFile;
+
 /// One file in a transfer (for per-file progress bars).
 #[derive(Clone, Debug)]
 pub struct TransferFile {
@@ -28,6 +32,30 @@ pub struct TransferUpdate {
 }
 
 pub type ProgressTx = UnboundedSender<TransferUpdate>;
+
+/// Receiver -> GUI: a sender asks for approval before any bytes flow.
+/// The GUI answers through `verdict` (true = allow, false = deny).
+pub struct ApprovalRequest {
+    pub sender_name: String,
+    pub sender_ip: String,
+    /// Full offer in send order (dirs + files) for the approval screen.
+    pub offer: Vec<OfferFile>,
+    pub total: u64,
+    pub verdict: tokio::sync::oneshot::Sender<bool>,
+    pub progress_rx: tokio::sync::mpsc::UnboundedReceiver<TransferUpdate>,
+    /// Set by the GUI Stop button; the engine polls it between entries.
+    pub stop: Arc<AtomicBool>,
+}
+
+pub type ApprovalTx = UnboundedSender<ApprovalRequest>;
+
+/// Tab auto-close markers: a transfer killed from the other side (TCP drop)
+/// closes the tab on both ends instead of lingering as Failed.
+pub const STOPPED_BY_SENDER: &str = "Stopped by sender";
+pub const STOPPED_BY_RECEIVER: &str = "Stopped by receiver";
+
+/// Sender verdict-deny message: shown red in the tab title + error popup.
+pub const DECLINED: &str = "Declined by receiver";
 
 /// Rich progress report including per-file position.
 pub fn report_file(
@@ -95,6 +123,23 @@ pub fn report_error(tx: &Option<ProgressTx>, sent: u64, total: u64, err: &str) {
             label: String::new(),
             done: true,
             error: Some(err.to_string()),
+            files: None,
+            file_index: None,
+            file_sent: None,
+        });
+    }
+}
+
+/// Status-only update (e.g. "Waiting for approval…"): keeps current
+/// files/bars, just swaps the label. Never marks done.
+pub fn report_status(tx: &Option<ProgressTx>, sent: u64, total: u64, label: &str) {
+    if let Some(t) = tx {
+        let _ = t.send(TransferUpdate {
+            sent_bytes: sent,
+            total_bytes: total,
+            label: label.to_string(),
+            done: false,
+            error: None,
             files: None,
             file_index: None,
             file_sent: None,
